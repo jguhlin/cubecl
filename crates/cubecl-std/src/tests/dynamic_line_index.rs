@@ -99,8 +99,8 @@ pub fn test_line_index_static<R: Runtime, F: Float + CubeElement>(client: Comput
             &client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(2),
-            ArrayArg::from_raw_parts::<F>(&input, 1, line_size as usize),
-            ArrayArg::from_raw_parts::<F>(&output, 1, line_size as usize),
+            ArrayArg::from_raw_parts::<F>(&input, input_vals.len(), line_size as usize),
+            ArrayArg::from_raw_parts::<F>(&output, line_size as usize, line_size as usize),
             config,
         )
         .unwrap();
@@ -131,8 +131,8 @@ pub fn test_line_index_dynamic<R: Runtime, F: Float + CubeElement>(client: Compu
             &client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(config.cube_dim),  // Launch with 1 thread to match config
-            ArrayArg::from_raw_parts::<F>(&input, 1, line_size as usize),
-            ArrayArg::from_raw_parts::<F>(&output, 1, line_size as usize),
+            ArrayArg::from_raw_parts::<F>(&input, input_vals.len(), line_size as usize),
+            ArrayArg::from_raw_parts::<F>(&output, line_size as usize, line_size as usize),
             config,
         )
         .unwrap();
