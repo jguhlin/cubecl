@@ -525,12 +525,11 @@ impl IndexAssign {
             let mut item = out_list.item();
             item.vectorization = line_size as usize;
             let addr_space = D::address_space_for_variable(out_list);
-            let qualifier = out_list.const_qualifier();
             let tmp = Variable::tmp_declared(item);
 
             writeln!(
                 f,
-                "{qualifier} {addr_space}{item} *{tmp} = reinterpret_cast<{qualifier} {item}*>({out_list});"
+                "{addr_space}{item} *{tmp} = reinterpret_cast<{addr_space}{item}*>({out_list});"
             )?;
 
             return IndexAssign::format(f, index, value, &tmp, 0);
@@ -632,12 +631,11 @@ impl Index {
             let mut item = list.item();
             item.vectorization = line_size as usize;
             let addr_space = D::address_space_for_variable(list);
-            let qualifier = list.const_qualifier();
             let tmp = Variable::tmp_declared(item);
 
             writeln!(
                 f,
-                "{qualifier} {addr_space}{item} *{tmp} = reinterpret_cast<{qualifier} {item}*>({list});"
+                "{addr_space}{item} *{tmp} = reinterpret_cast<{addr_space}{item}*>({list});"
             )?;
 
             return Index::format(f, &tmp, index, out, 0);
