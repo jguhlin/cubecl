@@ -123,14 +123,14 @@ pub fn test_line_index_dynamic<R: Runtime, F: Float + CubeElement>(client: Compu
 
     let config = ReproConfig {
         line_size,
-        cube_dim: 1,
+        cube_dim: 1,  // Kernel checks: if cube_dim == u32::new(1)
     };
 
     unsafe {
         repro_line_index_dynamic::launch_unchecked::<F, R>(
             &client,
             CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(2),
+            CubeDim::new_1d(config.cube_dim),  // Launch with 1 thread to match config
             ArrayArg::from_raw_parts::<F>(&input, 1, line_size as usize),
             ArrayArg::from_raw_parts::<F>(&output, 1, line_size as usize),
             config,
