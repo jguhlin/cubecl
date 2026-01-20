@@ -760,10 +760,10 @@ impl<D: Dialect> IndexAssignVector<D> {
             _ => {
                 let elem = out.elem();
                 let addr_space = D::address_space_for_variable(out);
-                // Fix: Use array subscript syntax for writes.
+                // Fix: Use array subscript syntax for writes (consistent with reads).
                 // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).
-                // Generated: *((float*)&vec + index) = value
-                return writeln!(f, "*(({addr_space}{elem}*)&{out} + {lhs}) = {rhs};");
+                // Generated: reinterpret_cast<float*>(&vec)[index] = value
+                return writeln!(f, "reinterpret_cast<{addr_space}{elem}*>(&{out})[{lhs}] = {rhs};");
             }
         };
 
