@@ -1,6 +1,7 @@
 /// Re-export for testgen macros.
 pub use test_log;
 
+pub mod dynamic_line_index;
 pub mod event;
 pub mod reinterpret_slice;
 pub mod tensor;
@@ -17,6 +18,7 @@ macro_rules! testgen {
             cubecl_std::testgen_reinterpret_slice!();
             cubecl_std::testgen_trigonometry!();
             cubecl_std::testgen_event!();
+            cubecl_std::testgen_dynamic_line_index!();
         }
     };
 }
