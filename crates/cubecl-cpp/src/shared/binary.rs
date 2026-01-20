@@ -736,12 +736,14 @@ impl<D: Dialect> IndexVector<D> {
             }
             _ => {
                 let elem = out.elem();
-                let qualifier = out.const_qualifier();
                 let addr_space = D::address_space_for_variable(out);
                 let out = out.fmt_left();
+                // Fix: Use array subscript syntax without const qualifier.
+                // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).
+                // Generated: element = reinterpret_cast<float*>(&vec)[index]
                 writeln!(
                     f,
-                    "{out} = reinterpret_cast<{addr_space}{elem}{qualifier}*>(&{lhs})[{rhs}];"
+                    "{out} = reinterpret_cast<{addr_space}{elem}*>(&{lhs})[{rhs}];"
                 )
             }
         }
@@ -760,6 +762,9 @@ impl<D: Dialect> IndexAssignVector<D> {
             _ => {
                 let elem = out.elem();
                 let addr_space = D::address_space_for_variable(out);
+                // Fix: Use array subscript syntax for writes.
+                // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).
+                // Generated: *((float*)&vec + index) = value
                 return writeln!(f, "*(({addr_space}{elem}*)&{out} + {lhs}) = {rhs};");
             }
         };
