@@ -631,11 +631,12 @@ impl Index {
             let mut item = list.item();
             item.vectorization = line_size as usize;
             let addr_space = D::address_space_for_variable(list);
+            let const_qual = if list.is_const() { "const " } else { "" };
             let tmp = Variable::tmp_declared(item);
 
             writeln!(
                 f,
-                "{addr_space}{item} *{tmp} = reinterpret_cast<{addr_space}{item}*>({list});"
+                "{addr_space}{const_qual}{item} *{tmp} = reinterpret_cast<{addr_space}{const_qual}{item}*>({list});"
             )?;
 
             return Index::format(f, &tmp, index, out, 0);
@@ -735,13 +736,16 @@ impl<D: Dialect> IndexVector<D> {
             _ => {
                 let elem = out.elem();
                 let addr_space = D::address_space_for_variable(out);
+                let const_qual = if lhs.is_const() { "const " } else { "" };
                 let out = out.fmt_left();
-                // Fix: Use array subscript syntax without const qualifier.
+                // Fix: Use array subscript syntax with const qualifier when lhs is const.
                 // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).
-                // Generated: element = reinterpret_cast<float*>(&vec)[index]
+                // When lhs is const, we must cast to const float* to avoid casting away const.
+                // Generated (lhs non-const): element = reinterpret_cast<float*>(&vec)[index]
+                // Generated (lhs const): element = reinterpret_cast<const float*>(&vec)[index]
                 writeln!(
                     f,
-                    "{out} = reinterpret_cast<{addr_space}{elem}*>(&{lhs})[{rhs}];"
+                    "{out} = reinterpret_cast<{addr_space}{const_qual}{elem}*>(&{lhs})[{rhs}];"
                 )
             }
         }
