@@ -22,6 +22,9 @@ default = [
     "cubecl-common/default",
     "cubecl-core/default",
 ]
+cuda-12060 = ["cudarc/cuda-12060"]
+cuda-12080 = ["cudarc/cuda-12080"]
+cuda-13000 = ["cudarc/cuda-13000"]
 ptx-wmma = []
 std = ["cubecl-runtime/std", "cubecl-common/std", "cubecl-core/std"]
 

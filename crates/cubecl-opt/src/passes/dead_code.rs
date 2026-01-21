@@ -42,6 +42,30 @@ fn search_loop(opt: &mut Optimizer) -> bool {
         visit_noop,
     );
 
+    // Collect variables that depend on GlobalInputArray (function arguments)
+    // These should be treated as "used" to prevent over-aggressive DCE
+    // when arguments are only used in eliminated comptime branches
+    let func_arg_vars = Rc::new(RefCell::new(HashSet::new()));
+    for node in nodes.iter() {
+        let ops = opt.program[*node].ops.borrow().values().cloned().collect::<Vec<_>>();
+        for op in ops {
+            // If this operation reads from a GlobalInputArray, mark its output as a function arg variable
+            if let Some(out) = op.out {
+                let uses_global_input = op.operation.args().map_or(false, |args| {
+                    args.iter().any(|v| {
+                        matches!(
+                            v.kind,
+                            VariableKind::GlobalInputArray(_)
+                        )
+                    })
+                });
+                if uses_global_input {
+                    func_arg_vars.borrow_mut().insert(out);
+                }
+            }
+        }
+    }
+
     for node in nodes {
         let phi = opt.block(node).phi_nodes.borrow().clone();
         let filtered_phi = phi
@@ -67,6 +91,21 @@ fn search_loop(opt: &mut Optimizer) -> bool {
                 VariableKind::GlobalInputArray(_) | VariableKind::GlobalOutputArray(_)
             ) && !var_used.borrow().contains(&out)
             {
+                // FIX: Don't eliminate if this operation's output depends on function arguments
+                // This prevents over-aggressive DCE when arguments are only used in comptime
+                // conditionals that evaluate to false
+                if func_arg_vars.borrow().contains(&out) {
+                    continue;
+                }
+
+                // Also check if the operation's inputs depend on function arguments
+                let uses_func_arg = op.operation.args().map_or(false, |args| {
+                    args.iter().any(|v| func_arg_vars.borrow().contains(v))
+                });
+                if uses_func_arg {
+                    continue;
+                }
+
                 opt.program[node].ops.borrow_mut().remove(idx);
                 contains_modification = true;
             }
