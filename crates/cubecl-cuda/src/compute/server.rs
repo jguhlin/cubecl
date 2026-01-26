@@ -329,10 +329,7 @@ impl ComputeServer for CudaServer {
                 },
                 #[cfg(cuda_12080)]
                 TensorMapFormat::Im2colWide(args) => unsafe {
-                    use cudarc::driver::sys::{
-                        CUtensorMapIm2ColWideMode, cuTensorMapEncodeIm2colWide,
-                    };
-                    cuTensorMapEncodeIm2colWide(
+                    cudarc::driver::sys::cuTensorMapEncodeIm2colWide(
                         map_ptr.as_mut_ptr(),
                         elem_to_tensor_map_type(map.storage_ty),
                         map.rank as u32,
@@ -345,7 +342,7 @@ impl ComputeServer for CudaServer {
                         args.pixels_per_column,
                         elem_stride.as_ptr(),
                         interleave_to_cuda(map.interleave),
-                        CUtensorMapIm2ColWideMode::CU_TENSOR_MAP_IM2COL_WIDE_MODE_W,
+                        cudarc::driver::sys::CUtensorMapIm2ColWideMode::CU_TENSOR_MAP_IM2COL_WIDE_MODE_W,
                         swizzle_to_cuda(map.swizzle),
                         prefetch_to_cuda(map.prefetch),
                         oob_to_cuda(map.oob_fill),
@@ -670,7 +667,11 @@ fn elem_to_tensor_map_type(ty: StorageType) -> CUtensorMapDataType {
         // packed fp4 should be treated as single 4-bit values to simplify indexing/shape handling
         // So a tile of width 16 with fp4 elements is 8 x fp4x2 elements wide.
         #[cfg(cuda_12080)]
-        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => {
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B
+        }
+        #[cfg(not(cuda_12080))]
+        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => CU_TENSOR_MAP_DATA_TYPE_UINT8, // Fallback for older CUDA
         StorageType::Scalar(ElemType::Float(kind)) => match kind {
             // There's no special handling for FP8, so load as u8. `0u8 == 0.0` when reinterpreting.
             FloatKind::E2M1 // single fp4s are padded to a full byte
@@ -719,11 +720,17 @@ fn swizzle_to_cuda(swizzle: TensorMapSwizzle) -> CUtensorMapSwizzle {
         TensorMapSwizzle::B64 => CU_TENSOR_MAP_SWIZZLE_64B,
         TensorMapSwizzle::B128 => CU_TENSOR_MAP_SWIZZLE_128B,
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom32B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
+        TensorMapSwizzle::B128Atom32B => {
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B
+        }
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom32BFlip8B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B,
+        TensorMapSwizzle::B128Atom32BFlip8B => {
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B
+        }
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom64B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B,
+        TensorMapSwizzle::B128Atom64B => {
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B
+        }
         #[cfg(not(cuda_12080))]
         _ => unimplemented!("Swizzle atomicity requires CUDA 12.8 or higher"),
     }
