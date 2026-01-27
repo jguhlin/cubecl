@@ -473,7 +473,12 @@ impl Type {
     }
 
     pub fn line(self, line_size: LineSize) -> Type {
-        Type::Line(self.storage_type(), line_size)
+        // line_size=0 or 1 means scalar (single element, no vectorization)
+        if line_size <= 1 {
+            Type::Scalar(self.storage_type())
+        } else {
+            Type::Line(self.storage_type(), line_size)
+        }
     }
 
     pub fn line_size(&self) -> LineSize {

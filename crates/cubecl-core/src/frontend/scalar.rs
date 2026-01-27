@@ -78,7 +78,8 @@ impl InputScalar {
                     UIntKind::U32 => write::<u32>(val, &mut out.data),
                     UIntKind::U64 => write::<u64>(val, &mut out.data),
                 },
-                ElemType::Bool => panic!("Bool isn't a scalar"),
+                // Bool is stored as u8 (0 or 1)
+                ElemType::Bool => write::<u8>(val, &mut out.data),
             },
             other => unimplemented!("{other} not supported for scalars"),
         };
