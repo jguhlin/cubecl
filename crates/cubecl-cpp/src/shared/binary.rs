@@ -522,8 +522,17 @@ impl IndexAssign {
         };
 
         if line_size > 0 {
+            // Fix: For packed types (BF16x2, F16x2), use unpacked base element type for correct pointer arithmetic.
+            let list_elem = *out_list.item().elem();
+            let cast_elem = match list_elem {
+                Elem::BF16x2 | Elem::F16x2 => list_elem.unpacked(),  // BF16x2 → BF16, F16x2 → F16
+                _ => list_elem,
+            };
+
             let mut item = out_list.item();
             item.vectorization = line_size as usize;
+            // Replace the element type with the correct (possibly unpacked) one
+            item.elem = cast_elem;
             let addr_space = D::address_space_for_variable(out_list);
             let tmp = Variable::tmp_declared(item);
 
@@ -620,6 +629,15 @@ impl Index {
         out: &Variable<D>,
         line_size: u32,
     ) -> std::fmt::Result {
+        let list_item = list.item();
+
+        // Fix: When line_size=0 but list has vectorization > 1 (Line array), use the line_size code path
+        let effective_line_size = if line_size == 0 && list_item.vectorization > 1 {
+            list_item.vectorization as u32
+        } else {
+            line_size
+        };
+
         if matches!(
             list,
             Variable::LocalMut { .. } | Variable::LocalConst { .. } | Variable::Constant(..)
@@ -627,9 +645,20 @@ impl Index {
             return IndexVector::format(f, list, index, out);
         }
 
-        if line_size > 0 {
+        if effective_line_size > 0 {
+            // Fix: For packed types (BF16x2, F16x2), use unpacked base element type for correct pointer arithmetic.
+            let list_elem = *list.item().elem();
+            let list_item = list.item();
+
+            let cast_elem = match list_elem {
+                Elem::BF16x2 | Elem::F16x2 => list_elem.unpacked(),  // BF16x2 → BF16, F16x2 → F16
+                _ => list_elem,
+            };
+
             let mut item = list.item();
-            item.vectorization = line_size as usize;
+            item.vectorization = effective_line_size as usize;
+            // Replace the element type with the correct (possibly unpacked) one
+            item.elem = cast_elem;
             let addr_space = D::address_space_for_variable(list);
             let const_qual = if list.is_const() { "const " } else { "" };
             let tmp = Variable::tmp_declared(item);
@@ -734,7 +763,14 @@ impl<D: Dialect> IndexVector<D> {
                 writeln!(f, "{out} = {lhs};")
             }
             _ => {
-                let elem = out.elem();
+                // Fix: For packed types (BF16x2, F16x2), use unpacked base element type for correct pointer arithmetic.
+                // When Line<bf16> is optimized to BF16x2 (4-byte vector), we must cast to bf16* (2 bytes) not float* (4 bytes).
+                // This ensures correct pointer arithmetic: base + idx * 2 instead of base + idx * 4.
+                let lhs_elem = *lhs.item().elem();
+                let elem = match lhs_elem {
+                    Elem::BF16x2 | Elem::F16x2 => lhs_elem.unpacked(),  // BF16x2 → BF16, F16x2 → F16
+                    _ => out.elem(),  // Existing behavior for other types
+                };
                 let addr_space = D::address_space_for_variable(out);
                 let const_qual = if lhs.is_const() { "const " } else { "" };
                 let out = out.fmt_left();
@@ -762,7 +798,14 @@ impl<D: Dialect> IndexAssignVector<D> {
         let index = match lhs {
             Variable::Constant(value, _) => value.as_usize(),
             _ => {
-                let elem = out.elem();
+                // Fix: For packed types (BF16x2, F16x2), use unpacked base element type for correct pointer arithmetic.
+                // When Line<bf16> is optimized to BF16x2 (4-byte vector), we must cast to bf16* (2 bytes) not float* (4 bytes).
+                // This ensures correct pointer arithmetic: base + idx * 2 instead of base + idx * 4.
+                let lhs_elem = *lhs.item().elem();
+                let elem = match lhs_elem {
+                    Elem::BF16x2 | Elem::F16x2 => lhs_elem.unpacked(),  // BF16x2 → BF16, F16x2 → F16
+                    _ => out.elem(),  // Existing behavior for other types
+                };
                 let addr_space = D::address_space_for_variable(out);
                 // Fix: Use array subscript syntax for writes (consistent with reads).
                 // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).

@@ -473,10 +473,7 @@ impl Type {
     }
 
     pub fn line(self, line_size: LineSize) -> Type {
-        match line_size > 1 {
-            true => Type::Line(self.storage_type(), line_size),
-            false => Type::Scalar(self.storage_type()),
-        }
+        Type::Line(self.storage_type(), line_size)
     }
 
     pub fn line_size(&self) -> LineSize {

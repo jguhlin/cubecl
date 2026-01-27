@@ -22,6 +22,7 @@ default = [
     "cubecl-common/default",
     "cubecl-core/default",
 ]
+cuda-12050 = ["cudarc/cuda-12050"]
 cuda-12060 = ["cudarc/cuda-12060"]
 cuda-12080 = ["cudarc/cuda-12080"]
 cuda-13000 = ["cudarc/cuda-13000"]
@@ -50,6 +51,7 @@ cubecl-cpp = { path = "../cubecl-cpp", version = "=0.9.0", default-features = fa
     "cuda",
 ] }
 cubecl-runtime = { path = "../cubecl-runtime", version = "=0.9.0", default-features = false, features = [
+    "std",
     "channel-mutex",
 ] }
 cudarc = { workspace = true }

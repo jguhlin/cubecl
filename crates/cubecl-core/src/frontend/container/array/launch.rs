@@ -132,13 +132,17 @@ impl<C: CubePrimitive> LaunchArg for Array<C> {
 
     fn compilation_arg<R: Runtime>(runtime_arg: &Self::RuntimeArg<'_, R>) -> Self::CompilationArg {
         match runtime_arg {
-            ArrayArg::Handle { line_size, .. } => ArrayCompilationArg {
-                inplace: None,
-                line_size: *line_size,
+            ArrayArg::Handle { line_size, .. } => {
+                ArrayCompilationArg {
+                    inplace: None,
+                    line_size: *line_size,
+                }
             },
-            ArrayArg::Alias { input_pos } => ArrayCompilationArg {
-                inplace: Some(*input_pos as Id),
-                line_size: 0,
+            ArrayArg::Alias { input_pos } => {
+                ArrayCompilationArg {
+                    inplace: Some(*input_pos as Id),
+                    line_size: 0,
+                }
             },
         }
     }
@@ -147,8 +151,11 @@ impl<C: CubePrimitive> LaunchArg for Array<C> {
         arg: &Self::CompilationArg,
         builder: &mut KernelBuilder,
     ) -> ExpandElementTyped<Array<C>> {
+        let scalar_type = C::as_type(&builder.scope);
+        let scalar_type_wrapped = Type::new(scalar_type);
+        let line_type = scalar_type_wrapped.line(arg.line_size);
         builder
-            .input_array(Type::new(C::as_type(&builder.scope)).line(arg.line_size))
+            .input_array(line_type)
             .into()
     }
     fn expand_output(
