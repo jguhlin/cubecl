@@ -105,13 +105,14 @@ where
         _ => index,
     };
 
+    let item_lhs = list.value_type();
     let ty = match vector_size {
         Some(vector_size) => list.value_type().with_vector_size(vector_size),
-        None => list.value_type(),
+        None => item_lhs,
     };
     let class = list.address_space();
     let out = scope.create_local(Type::pointer(ty, class));
-    let vector_size = vector_size.unwrap_or(0);
+    let vector_size = vector_size.unwrap_or_else(|| item_lhs.vector_size());
 
     scope.register(Instruction::new(
         Memory::Index(IndexOperands {

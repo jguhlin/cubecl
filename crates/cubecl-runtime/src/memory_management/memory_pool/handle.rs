@@ -1,4 +1,5 @@
 use crate::memory_management::MemoryHandle;
+use alloc::format;
 use alloc::sync::Arc;
 use core::cell::Cell;
 
@@ -98,14 +99,6 @@ impl ManagedMemoryDescriptor {
         });
     }
 
-    /// Update only the memory page position for the given [`ManagedMemoryId`].
-    pub fn update_page(&self, page: u16) {
-        self.location.update(|mut loc| {
-            loc.page = page;
-            loc
-        });
-    }
-
     /// Retrieves the current location.
     pub(crate) fn location(&self) -> MemoryLocation {
         self.location.get()
@@ -159,6 +152,27 @@ impl ManagedMemoryHandle {
     /// Retrieves the descriptor for the current handle.
     pub(crate) fn descriptor(&self) -> &ManagedMemoryDescriptor {
         &self.descriptor
+    }
+
+    /// Returns a compact debug summary for bind/reserve diagnostics.
+    pub fn debug_summary(&self) -> alloc::string::String {
+        let descriptor = self.descriptor();
+        let location = descriptor.location();
+        format!(
+            "id={} pool={} page={} slice={} init={} can_mut={} is_free={}",
+            descriptor.id.value,
+            location.pool,
+            location.page,
+            location.slice,
+            location.init,
+            self.can_mut(),
+            self.is_free(),
+        )
+    }
+
+    /// Returns whether this handle currently points at an initialized location.
+    pub fn is_initialized(&self) -> bool {
+        self.descriptor().location().init != 0
     }
 
     /// Return whether the current handle can be modified in-place.

@@ -113,6 +113,17 @@ impl<F: StreamFactory> StreamPool<F> {
     pub fn stream_index(&mut self, id: &StreamId) -> usize {
         stream_index(id, self.max_streams)
     }
+
+    /// Calls `func` on every stream slot that has been initialized (i.e. not `None`).
+    ///
+    /// Uninitialized slots are skipped; no new streams are created.
+    pub fn for_each_initialized<Func: FnMut(&mut F::Stream)>(&mut self, mut func: Func) {
+        for slot in &mut self.streams {
+            if let Some(stream) = slot {
+                func(stream);
+            }
+        }
+    }
 }
 
 /// Maps a stream ID to an index within the pool's capacity using modulo arithmetic.

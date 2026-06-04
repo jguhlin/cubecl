@@ -121,7 +121,25 @@ impl ComputeServer for CudaServer {
             Err(err) => unreachable!("{err}"),
         };
 
-        let reserved = command.reserve(size).unwrap();
+        let reserved = match command.reserve(size) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "[CUBECL] initialize_memory FAILED for size={}: {:?}",
+                    size,
+                    e
+                );
+                return;
+            }
+        };
+        if !reserved.is_initialized() {
+            log::warn!(
+                "[CUBECL] initialize_memory produced uninitialized reserved handle: size={} reserved=[{}] assigned=[{}]",
+                size,
+                reserved.debug_summary(),
+                memory.debug_summary(),
+            );
+        }
         command.bind(reserved, memory);
     }
 
@@ -575,6 +593,190 @@ impl CudaServer {
         }
     }
 
+    /// Clean GPU and pinned CPU memory pools on every initialized stream slot.
+    pub fn memory_cleanup_all(&mut self) {
+        self.streams.for_each_stream_initialized(|stream| {
+            stream.drop_queue.flush(|| Fence::new(stream.sys));
+            stream.memory_management_gpu.cleanup(true);
+            stream.memory_management_gpu.flush_dealloc_queue();
+            stream.memory_management_cpu.cleanup(true);
+            stream.memory_management_cpu.flush_dealloc_queue();
+        });
+    }
+
+    /// Returns the raw CUDA stream handle for the given stream ID.
+    ///
+    /// This is useful for CUDA-specific operations like graph capture that
+    /// need direct access to the underlying `CUstream`.
+    pub fn raw_cuda_stream(&mut self, stream_id: StreamId) -> cudarc::driver::sys::CUstream {
+        let mut streams = self
+            .streams
+            .resolve(stream_id, std::iter::empty(), false)
+            .expect("failed to resolve stream for raw_cuda_stream");
+        streams.current().sys
+    }
+
+    /// Begin capturing CUDA operations on this stream into a replayable graph.
+    pub fn graph_begin_capture(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        let cu_stream = self.raw_cuda_stream(stream_id);
+        unsafe {
+            cudarc::driver::result::stream::begin_capture(
+                cu_stream,
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+        }
+    }
+
+    /// End stream capture and instantiate a replayable graph.
+    pub fn graph_end_and_instantiate(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Result<
+        (
+            cudarc::driver::sys::CUgraph,
+            cudarc::driver::sys::CUgraphExec,
+        ),
+        cudarc::driver::DriverError,
+    > {
+        let cu_stream = self.raw_cuda_stream(stream_id);
+        let cu_graph = unsafe { cudarc::driver::result::stream::end_capture(cu_stream) }?;
+        let cu_graph_exec = unsafe {
+            let mut graph_exec = MaybeUninit::uninit();
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), cu_graph, 0)
+                .result()?;
+            graph_exec.assume_init()
+        };
+        Ok((cu_graph, cu_graph_exec))
+    }
+
+    /// Launch a previously captured CUDA graph on this stream.
+    pub fn graph_launch(
+        &mut self,
+        graph_exec: cudarc::driver::sys::CUgraphExec,
+        stream_id: StreamId,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        let cu_stream = self.raw_cuda_stream(stream_id);
+        unsafe { cudarc::driver::result::graph::launch(graph_exec, cu_stream) }
+    }
+
+    /// Destroy a CUDA graph and its instantiated exec object.
+    ///
+    /// # Safety
+    ///
+    /// All in-flight launches using these graph handles must have completed.
+    pub unsafe fn graph_destroy(
+        &mut self,
+        cu_graph: cudarc::driver::sys::CUgraph,
+        cu_graph_exec: cudarc::driver::sys::CUgraphExec,
+    ) {
+        let _ = unsafe { cudarc::driver::result::graph::exec_destroy(cu_graph_exec) };
+        let _ = unsafe { cudarc::driver::result::graph::destroy(cu_graph) };
+    }
+
+    /// Returns the raw CUDA stream handle for the default stream.
+    pub fn default_cuda_stream(&mut self) -> cudarc::driver::sys::CUstream {
+        self.raw_cuda_stream(StreamId { value: 0 })
+    }
+
+    /// Returns the raw CUDA stream handle for the current thread's stream.
+    pub fn current_cuda_stream(&mut self) -> cudarc::driver::sys::CUstream {
+        self.raw_cuda_stream(StreamId::current())
+    }
+
+    /// Begin capturing CUDA operations on the default stream.
+    pub fn graph_begin_capture_default(&mut self) -> Result<(), cudarc::driver::DriverError> {
+        self.graph_begin_capture(StreamId { value: 0 })
+    }
+
+    /// Begin capturing all CUDA operations on the current thread's stream.
+    ///
+    /// Kernel launches dispatched through `ComputeClient::execute` use the
+    /// thread-local `StreamId::current()`. Capturing with this method ensures
+    /// those kernel launches land on the captured stream, not stream 0.
+    pub fn graph_begin_capture_current_stream(
+        &mut self,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        self.graph_begin_capture(StreamId::current())
+    }
+
+    /// End stream capture and instantiate a replayable graph on the default stream.
+    pub fn graph_end_and_instantiate_default(
+        &mut self,
+    ) -> Result<
+        (
+            cudarc::driver::sys::CUgraph,
+            cudarc::driver::sys::CUgraphExec,
+        ),
+        cudarc::driver::DriverError,
+    > {
+        self.graph_end_and_instantiate(StreamId { value: 0 })
+    }
+
+    /// End stream capture and instantiate a replayable graph on the current thread's stream.
+    pub fn graph_end_and_instantiate_current_stream(
+        &mut self,
+    ) -> Result<
+        (
+            cudarc::driver::sys::CUgraph,
+            cudarc::driver::sys::CUgraphExec,
+        ),
+        cudarc::driver::DriverError,
+    > {
+        self.graph_end_and_instantiate(StreamId::current())
+    }
+
+    /// Allocate page-locked host memory.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer must be freed with `free_host_pinned`.
+    pub unsafe fn alloc_host_pinned(
+        &mut self,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void, cudarc::driver::DriverError> {
+        unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+    }
+
+    /// Free page-locked host memory allocated with `alloc_host_pinned`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been allocated by `alloc_host_pinned` and not already freed.
+    pub unsafe fn free_host_pinned(&mut self, ptr: *mut std::ffi::c_void) {
+        let _ = unsafe { cudarc::driver::result::free_host(ptr) };
+    }
+
+    /// Enqueue an async host-to-device copy on this stream.
+    ///
+    /// # Safety
+    ///
+    /// `src` must point to at least `bytes` initialized bytes and `dst` must be a valid device
+    /// pointer for that range.
+    pub unsafe fn htod_async_raw(
+        &mut self,
+        dst: u64,
+        src: *const std::ffi::c_void,
+        bytes: usize,
+        stream_id: StreamId,
+    ) {
+        let cu_stream = self.raw_cuda_stream(stream_id);
+        let src_slice = unsafe { std::slice::from_raw_parts(src as *const u8, bytes) };
+        let _ = unsafe { cudarc::driver::result::memcpy_htod_async(dst, src_slice, cu_stream) };
+    }
+
+    /// Get the raw `CUdeviceptr` for a tensor handle.
+    pub fn tensor_dev_ptr(
+        &mut self,
+        binding: Binding,
+        stream_id: StreamId,
+    ) -> Result<u64, ServerError> {
+        let resource = self.get_resource(binding, stream_id)?;
+        Ok(resource.resource().ptr)
+    }
+
     fn command_no_inputs(
         &mut self,
         stream_id: StreamId,
@@ -683,38 +885,54 @@ impl CudaServer {
             return Ok(());
         }
 
-        let (info_const, info_binding) = if grid_constants {
+        let (info_const, info_resource) = if grid_constants {
             let info = &bindings.info;
 
-            let mut handle = Option::None;
+            let mut resource = Option::None;
             if info.dynamic_metadata_offset < info.data.len() {
-                let dyn_meta = &bytemuck::cast_slice(&info.data[info.dynamic_metadata_offset..]);
-                handle = Some(command.create_with_data(dyn_meta)?);
+                let dyn_meta = bytemuck::cast_slice(&info.data[info.dynamic_metadata_offset..]);
+                resource = Some(command.upload_metadata(dyn_meta)?);
             }
 
-            (Some(info.data.as_ptr() as *mut c_void), handle)
+            (Some(info.data.as_ptr() as *mut c_void), resource)
         } else {
-            let mut handle = Option::None;
+            let mut resource = Option::None;
             if !bindings.info.data.is_empty() {
-                handle = Some(command.create_with_data(bytemuck::cast_slice(&bindings.info.data))?);
+                resource =
+                    Some(command.upload_metadata(bytemuck::cast_slice(&bindings.info.data))?);
             }
-            (None, handle)
+            (None, resource)
         };
 
-        let mut resources = bindings
+        let mut resources = Vec::new();
+        let num_tensor_maps = bindings.tensor_maps.len();
+        let num_buffers = bindings.buffers.len();
+        for (idx, binding) in bindings
             .tensor_maps
             .iter()
             .map(|it| it.binding.clone())
             .chain(bindings.buffers)
-            .map(|binding| command.resource(binding).expect("Resource to exist."))
-            .collect::<Vec<_>>();
+            .enumerate()
+        {
+            match command.resource(binding) {
+                Ok(r) => resources.push(r),
+                Err(e) => {
+                    log::warn!(
+                        "[CUBECL] Kernel binding #{}/{} failed (tensor_maps={}, buffers={})",
+                        idx,
+                        num_tensor_maps + num_buffers,
+                        num_tensor_maps,
+                        num_buffers,
+                    );
+                    return Err(ServerError::Io(e));
+                }
+            }
+        }
 
         let mut tensor_maps = Vec::with_capacity(bindings.tensor_maps.len());
 
         for TensorMapBinding { map, binding } in bindings.tensor_maps.into_iter() {
-            let resource = command
-                .resource(binding)
-                .expect("Tensor map resource exists.");
+            let resource = command.resource(binding)?;
             let device_ptr = resource.ptr as *mut c_void;
 
             let mut map_ptr = MaybeUninit::zeroed();
@@ -821,10 +1039,7 @@ impl CudaServer {
                 // SAFETY: Same invariants as `Im2col` above. Requires CUDA 12.8+.
                 #[cfg(cuda_12080)]
                 TensorMapFormat::Im2colWide(args) => unsafe {
-                    use cudarc::driver::sys::{
-                        CUtensorMapIm2ColWideMode, cuTensorMapEncodeIm2colWide,
-                    };
-                    cuTensorMapEncodeIm2colWide(
+                    cudarc::driver::sys::cuTensorMapEncodeIm2colWide(
                         map_ptr.as_mut_ptr(),
                         elem_to_tensor_map_type(map.storage_ty),
                         map.metadata.rank() as u32,
@@ -837,7 +1052,7 @@ impl CudaServer {
                         args.pixels_per_column,
                         elem_stride.as_ptr(),
                         interleave_to_cuda(map.interleave),
-                        CUtensorMapIm2ColWideMode::CU_TENSOR_MAP_IM2COL_WIDE_MODE_W,
+                        cudarc::driver::sys::CUtensorMapIm2ColWideMode::CU_TENSOR_MAP_IM2COL_WIDE_MODE_W,
                         swizzle_to_cuda(map.swizzle),
                         prefetch_to_cuda(map.prefetch),
                         oob_to_cuda(map.oob_fill),
@@ -869,11 +1084,7 @@ impl CudaServer {
             tensor_maps.push(binding);
         }
 
-        resources.extend(
-            info_binding
-                .into_iter()
-                .map(|s| command.resource(s.binding()).expect("Resource to exist")),
-        );
+        resources.extend(info_resource);
 
         command.kernel(
             kernel_id,
@@ -900,7 +1111,11 @@ fn elem_to_tensor_map_type(ty: StorageType) -> CUtensorMapDataType {
         // packed fp4 should be treated as single 4-bit values to simplify indexing/shape handling
         // So a tile of width 16 with fp4 elements is 8 x fp4x2 elements wide.
         #[cfg(cuda_12080)]
-        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => {
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B
+        }
+        #[cfg(not(cuda_12080))]
+        StorageType::Packed(ty, 2) if ty.size_bits() == 4 => CU_TENSOR_MAP_DATA_TYPE_UINT8, // Fallback for older CUDA
         StorageType::Scalar(ElemType::Float(kind)) => match kind {
             // There's no special handling for FP8, so load as u8. `0u8 == 0.0` when reinterpreting.
             FloatKind::E2M1 // single fp4s are padded to a full byte
@@ -949,11 +1164,13 @@ fn swizzle_to_cuda(swizzle: TensorMapSwizzle) -> CUtensorMapSwizzle {
         TensorMapSwizzle::B64 => CU_TENSOR_MAP_SWIZZLE_64B,
         TensorMapSwizzle::B128 => CU_TENSOR_MAP_SWIZZLE_128B,
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom32B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
+        TensorMapSwizzle::B128Atom32B => CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom32BFlip8B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B,
+        TensorMapSwizzle::B128Atom32BFlip8B => {
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B
+        }
         #[cfg(cuda_12080)]
-        TensorMapSwizzle::B128Atom64B => CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B,
+        TensorMapSwizzle::B128Atom64B => CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B,
         #[cfg(not(cuda_12080))]
         _ => unimplemented!("Swizzle atomicity requires CUDA 12.8 or higher"),
     }
@@ -1154,4 +1371,27 @@ fn check_tma_im2col(
     )?;
 
     Ok(())
+}
+#[cfg(test)]
+mod cleanup_tests {
+    #[test]
+    fn memory_cleanup_all_cleans_pinned_cpu_staging_pools() {
+        let source = include_str!("server.rs");
+        let cleanup = source
+            .split_once("pub fn memory_cleanup_all(&mut self)")
+            .and_then(|(_, tail)| {
+                tail.split_once("pub fn raw_cuda_stream")
+                    .map(|(head, _)| head)
+            })
+            .expect("memory_cleanup_all source");
+        assert!(
+            cleanup.contains("stream.drop_queue.flush(|| Fence::new(stream.sys));"),
+            "cleanup must drain upload drop queues before freeing pinned staging"
+        );
+        assert!(
+            cleanup.contains("stream.memory_management_cpu.cleanup(true);")
+                && cleanup.contains("stream.memory_management_cpu.flush_dealloc_queue();"),
+            "cleanup must free pinned CPU staging pools, not only GPU pools"
+        );
+    }
 }

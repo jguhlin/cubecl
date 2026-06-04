@@ -136,6 +136,7 @@ impl MemoryPage {
             let can_be_split = slice.storage.utilization.size > effective_size;
             let handle = slice.handle.clone();
             let storage_old = slice.storage.clone();
+            let location = slice.handle.descriptor().location();
 
             // Updates the current storage utilization.
             slice.storage.utilization.size = size;
@@ -146,6 +147,7 @@ impl MemoryPage {
                 self.add_new_slice(index, size, new_slice);
             }
 
+            handle.descriptor().update_location(location);
             return Some(handle);
         }
 
@@ -165,14 +167,6 @@ impl MemoryPage {
                 backtrace: BackTrace::capture(),
                 reason: alloc::format!("Memory slice {} doesn't exist", slice_index).into(),
             })
-    }
-
-    pub fn update_page(&mut self, page: u16) {
-        self.location_base.page = page;
-
-        for slice in self.slices.iter() {
-            slice.descriptor().update_page(page);
-        }
     }
 
     /// Recompute the memory page metadata to make sure adjacent slices are merged together into a

@@ -251,6 +251,9 @@ impl<M: DialectWmmaCompiler<Self>> DialectTypes<Self> for CudaDialect<M> {
     }
 
     fn compile_polyfills(f: &mut std::fmt::Formatter<'_>, flags: &Flags<Self>) -> std::fmt::Result {
+        if flags.inst_tma {
+            writeln!(f, "{TMA}")?;
+        }
         if flags.inst_tma_im2col {
             writeln!(f, "{TMA_LOAD_IM2COL}")?;
         }
@@ -595,31 +598,78 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for CudaDialect<M> 
     fn compile_warp_shuffle(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        elem: &Elem<Self>,
         source: &str,
     ) -> std::fmt::Result {
-        write!(f, "__shfl_sync(-1, {var}, {source})")
+        match elem {
+            Elem::BF16 => write!(
+                f,
+                "__short_as_bfloat16(static_cast<short>(__shfl_sync(-1, static_cast<int>(__bfloat16_as_short({var})), {source})))"
+            ),
+            Elem::F16 => write!(
+                f,
+                "__short_as_half(static_cast<short>(__shfl_sync(-1, static_cast<int>(__half_as_short({var})), {source})))"
+            ),
+            _ => write!(f, "__shfl_sync(-1, {var}, {source})"),
+        }
     }
     fn compile_warp_shuffle_xor(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
-        _elem: &Elem<Self>,
+        elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
-        write!(f, "__shfl_xor_sync(-1, {var}, {offset})")
+        match elem {
+            Elem::BF16 => write!(
+                f,
+                "__short_as_bfloat16(static_cast<short>(__shfl_xor_sync(-1, static_cast<int>(__bfloat16_as_short({var})), {offset})))"
+            ),
+            Elem::F16 => write!(
+                f,
+                "__short_as_half(static_cast<short>(__shfl_xor_sync(-1, static_cast<int>(__half_as_short({var})), {offset})))"
+            ),
+            _ => write!(f, "__shfl_xor_sync(-1, {var}, {offset})"),
+        }
     }
     fn compile_warp_shuffle_up(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
-        write!(f, "__shfl_up_sync(-1, {var}, {offset})")
+        match elem {
+            Elem::BF16 => write!(
+                f,
+                "__short_as_bfloat16(static_cast<short>(__shfl_up_sync(-1, static_cast<int>(__bfloat16_as_short({var})), {offset})))"
+            ),
+            Elem::F16 => write!(
+                f,
+                "__short_as_half(static_cast<short>(__shfl_up_sync(-1, static_cast<int>(__half_as_short({var})), {offset})))"
+            ),
+            _ => write!(f, "__shfl_up_sync(-1, {var}, {offset})"),
+        }
     }
     fn compile_warp_shuffle_down(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
-        write!(f, "__shfl_down_sync(-1, {var}, {offset})")
+        // bf16/f16: __shfl_*_sync operates on 32-bit registers but bf16/f16 only
+        // use 16 bits. The upper 16 bits are undefined after shuffle, which corrupts
+        // subsequent comparisons. Fix: cast to short, promote to int for shuffle,
+        // truncate back to short, reinterpret as bf16/f16.
+        match elem {
+            Elem::BF16 => write!(
+                f,
+                "__short_as_bfloat16(static_cast<short>(__shfl_down_sync(-1, static_cast<int>(__bfloat16_as_short({var})), {offset})))"
+            ),
+            Elem::F16 => write!(
+                f,
+                "__short_as_half(static_cast<short>(__shfl_down_sync(-1, static_cast<int>(__half_as_short({var})), {offset})))"
+            ),
+            _ => write!(f, "__shfl_down_sync(-1, {var}, {offset})"),
+        }
     }
     fn compile_warp_all<T: Component<Self>>(
         f: &mut std::fmt::Formatter<'_>,

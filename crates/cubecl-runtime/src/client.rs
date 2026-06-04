@@ -229,7 +229,7 @@ impl<R: Runtime> ComputeClient<R> {
                         alloc.strides.clone(),
                         desc.elem_size,
                     ),
-                    Bytes::from_bytes_vec(data.to_vec()),
+                    Bytes::from_bytes_vec(data),
                 )
             })
             .collect::<Vec<_>>();
@@ -265,7 +265,7 @@ impl<R: Runtime> ComputeClient<R> {
                         layout.strides.clone(),
                         desc.elem_size,
                     ),
-                    Bytes::from_bytes_vec(data.to_vec()),
+                    data,
                 )
             })
             .collect::<Vec<_>>();
@@ -298,6 +298,20 @@ impl<R: Runtime> ComputeClient<R> {
         .unwrap()
         .remove(0)
         .memory
+    }
+
+    /// Execute a closure with mutable access to the underlying compute server.
+    ///
+    /// This acquires the device mutex, runs the closure with `&mut R::Server`,
+    /// and returns the result.  Useful for runtime-specific operations that
+    /// need direct server access (e.g. CUDA graph capture).
+    pub fn with_server<'a, Re: Send + 'a, F: FnOnce(&mut R::Server) -> Re + Send + 'a>(
+        &'a self,
+        task: F,
+    ) -> Re {
+        self.device
+            .submit_blocking(task)
+            .expect("Communication channel with the server is down")
     }
 
     /// todo: docs
@@ -1070,5 +1084,41 @@ impl<R: Runtime> ComputeClient<R> {
         let num_candidates = max.trailing_zeros() + 1;
 
         (0..num_candidates).map(|i| 2usize.pow(i)).rev()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn create_paths_do_not_rebox_owned_upload_bytes() {
+        let source = include_str!("client.rs");
+        let do_create_from_slices = source
+            .split_once("fn do_create_from_slices")
+            .and_then(|(_, tail)| tail.split_once("fn do_create").map(|(head, _)| head))
+            .expect("do_create_from_slices source segment");
+        assert!(
+            do_create_from_slices.contains("Bytes::from_bytes_vec(data),"),
+            "owned Vec<u8> slices should move into Bytes without cloning"
+        );
+        assert!(
+            !do_create_from_slices.contains("Bytes::from_bytes_vec(data.to_vec())"),
+            "create_from_slice path should not clone owned upload Vecs"
+        );
+
+        let do_create = source
+            .split_once("fn do_create(")
+            .and_then(|(_, tail)| {
+                tail.split_once("pub fn create_from_slice")
+                    .map(|(head, _)| head)
+            })
+            .expect("do_create source segment");
+        assert!(
+            do_create.contains("),\n                    data,"),
+            "Bytes passed to create should retain their original allocation controller"
+        );
+        assert!(
+            !do_create.contains("Bytes::from_bytes_vec(data.to_vec())"),
+            "create(Bytes) must not force an extra host copy or erase allocation properties"
+        );
     }
 }

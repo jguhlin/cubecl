@@ -10,8 +10,9 @@ use alloc::vec::Vec;
 use core::fmt::Display;
 
 pub struct SlicedPool {
-    pages: Vec<(MemoryPage, StorageId)>,
-    pages_tmp: Vec<(MemoryPage, StorageId)>,
+    /// Pages stored as Option to support tombstone-based deallocation.
+    /// This keeps page indices stable so outstanding bindings remain valid.
+    pages: Vec<Option<(MemoryPage, StorageId)>>,
     page_size: u64,
     alignment: u64,
     max_alloc_size: u64,
@@ -22,7 +23,6 @@ impl SlicedPool {
     pub fn new(page_size: u64, max_slice_size: u64, alignment: u64, pool_pos: u8) -> Self {
         Self {
             pages: Vec::new(),
-            pages_tmp: Vec::new(),
             page_size,
             alignment,
             max_alloc_size: max_slice_size,
@@ -44,15 +44,29 @@ impl MemoryPool for SlicedPool {
     }
 
     fn find(&self, binding: &super::ManagedMemoryBinding) -> Result<&Slice, IoError> {
-        let (page, _) = &self.pages[binding.descriptor().page()];
+        let page_index = binding.descriptor().page();
+        let (page, _) = self
+            .pages
+            .get(page_index)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: cubecl_common::backtrace::BackTrace::capture(),
+                reason: alloc::format!(
+                    "SlicedPool: page {} doesn't exist (tombstone or out of range)",
+                    page_index
+                )
+                .into(),
+            })?;
         page.find(binding)
     }
 
     fn try_reserve(&mut self, size: u64) -> Option<super::ManagedMemoryHandle> {
-        for (page, _) in self.pages.iter_mut() {
-            page.coalesce();
-            if let Some(handle) = page.try_reserve(size) {
-                return Some(handle);
+        for slot in self.pages.iter_mut() {
+            if let Some((page, _)) = slot.as_mut() {
+                page.coalesce();
+                if let Some(handle) = page.try_reserve(size) {
+                    return Some(handle);
+                }
             }
         }
 
@@ -71,12 +85,21 @@ impl MemoryPool for SlicedPool {
         let storage = storage.alloc(self.page_size)?;
 
         let storage_id = storage.id;
+
+        // Find a tombstone slot or append.
+        let page_index = if let Some(idx) = self.pages.iter().position(|s| s.is_none()) {
+            idx
+        } else {
+            self.pages.push(None);
+            self.pages.len() - 1
+        };
+
         let mut location_base = self.location_base;
-        location_base.page = self.pages.len() as u16;
+        location_base.page = page_index as u16;
 
         let mut page = MemoryPage::new(storage, self.alignment, location_base);
         let returned = page.try_reserve(size);
-        self.pages.push((page, storage_id));
+        self.pages[page_index] = Some((page, storage_id));
 
         Ok(returned.expect("effective_size to be smaller than page_size"))
     }
@@ -89,9 +112,11 @@ impl MemoryPool for SlicedPool {
             bytes_reserved: 0,
         };
 
-        for (page, _) in self.pages.iter() {
-            let current = page.memory_usage();
-            usage = usage.combine(current);
+        for slot in self.pages.iter() {
+            if let Some((page, _)) = slot {
+                let current = page.memory_usage();
+                usage = usage.combine(current);
+            }
         }
 
         usage
@@ -111,20 +136,23 @@ impl MemoryPool for SlicedPool {
             return;
         }
 
-        for (mut page, id) in self.pages.drain(..) {
-            page.coalesce();
-            let summary = page.summary(false);
+        // Deallocate in-place using tombstones to keep page indices stable.
+        for slot in self.pages.iter_mut() {
+            if let Some((page, id)) = slot.as_mut() {
+                page.coalesce();
+                let summary = page.summary(false);
 
-            if summary.amount_free == summary.amount_total {
-                storage.dealloc(id);
-            } else {
-                let page_pos = self.pages_tmp.len() as u16;
-                page.update_page(page_pos);
-                self.pages_tmp.push((page, id));
+                if summary.amount_free == summary.amount_total {
+                    storage.dealloc(*id);
+                    *slot = None; // tombstone
+                }
             }
         }
 
-        core::mem::swap(&mut self.pages, &mut self.pages_tmp);
+        // Trim trailing tombstones to avoid unbounded growth.
+        while self.pages.last().map_or(false, |s| s.is_none()) {
+            self.pages.pop();
+        }
     }
 
     /// Binds a user defined [`ManagedMemoryHandle`] to a slice in this memory pool.
@@ -134,7 +162,19 @@ impl MemoryPool for SlicedPool {
         assigned: ManagedMemoryHandle,
         cursor: u64,
     ) -> Result<(), IoError> {
-        let (page, _) = &mut self.pages[reserved.descriptor().page()];
+        let page_index = reserved.descriptor().page();
+        let (page, _) = self
+            .pages
+            .get_mut(page_index)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: cubecl_common::backtrace::BackTrace::capture(),
+                reason: alloc::format!(
+                    "SlicedPool: page {} doesn't exist for bind (tombstone or out of range)",
+                    page_index
+                )
+                .into(),
+            })?;
 
         page.bind(reserved, assigned, cursor)?;
 
@@ -144,7 +184,7 @@ impl MemoryPool for SlicedPool {
 
 impl Display for SlicedPool {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.pages.is_empty() {
+        if !self.pages.iter().any(|s| s.is_some()) {
             return Ok(());
         }
 
@@ -154,20 +194,22 @@ impl Display for SlicedPool {
             BytesFormat::new(self.max_alloc_size)
         ))?;
 
-        for (page, id) in self.pages.iter() {
-            let summary = page.summary(false);
-            f.write_fmt(format_args!(
-                "   - Page {id} num_slices={} =>",
-                summary.num_total
-            ))?;
+        for (i, slot) in self.pages.iter().enumerate() {
+            if let Some((page, id)) = slot {
+                let summary = page.summary(false);
+                f.write_fmt(format_args!(
+                    "   - Page[{i}] {id} num_slices={} =>",
+                    summary.num_total
+                ))?;
 
-            let size_free = BytesFormat::new(summary.amount_free);
-            let size_full = BytesFormat::new(summary.amount_full);
-            let size_total = BytesFormat::new(summary.amount_total);
+                let size_free = BytesFormat::new(summary.amount_free);
+                let size_full = BytesFormat::new(summary.amount_full);
+                let size_total = BytesFormat::new(summary.amount_total);
 
-            f.write_fmt(format_args!(
-                " {size_free} free - {size_full} full - {size_total} total\n"
-            ))?;
+                f.write_fmt(format_args!(
+                    " {size_free} free - {size_full} full - {size_total} total\n"
+                ))?;
+            }
         }
 
         f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))?;

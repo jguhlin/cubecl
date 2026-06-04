@@ -1,1 +1,2 @@
+mod contiguous;
 mod identity;

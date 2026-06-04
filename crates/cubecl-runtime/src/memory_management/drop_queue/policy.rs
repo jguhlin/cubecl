@@ -32,8 +32,12 @@ pub(crate) struct FlushingPolicyState {
 impl FlushingPolicyState {
     /// Record a newly staged [`Bytes`] allocation.
     pub(crate) fn register(&mut self, bytes: &Bytes) {
-        self.bytes_count += 1;
-        self.bytes_size += bytes.len() as u32;
+        // Saturate instead of panicking on unusually large staging bursts.
+        // `should_flush()` will immediately trip once either counter reaches
+        // its configured maximum, which preserves the queue contract without
+        // making large model loads crash in debug/profile builds.
+        self.bytes_count = self.bytes_count.saturating_add(1);
+        self.bytes_size = self.bytes_size.saturating_add(bytes.len() as u32);
     }
 
     /// Reset all counters, typically called after a flush.

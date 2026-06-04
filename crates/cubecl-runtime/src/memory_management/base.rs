@@ -101,3 +101,27 @@ pub trait MemoryHandle<Binding>: Clone + core::fmt::Debug {
     /// Get the binding associated to the current handle.
     fn binding(self) -> Binding;
 }
+
+/// Determines if memory optimization should be applied based on size and alignment.
+///
+/// Only applies alignment optimization when the allocation is large enough that
+/// the padding overhead is justified by the performance gain from aligned accesses.
+///
+/// # Arguments
+/// * `size` - The size of the last dimension in bytes
+/// * `alignment` - The memory alignment boundary (e.g., 512 bytes)
+///
+/// # Returns
+/// `true` if alignment should be applied, `false` for contiguous layout
+///
+/// # Examples
+/// ```ignore
+/// // Small allocation - not worth padding
+/// assert_eq!(should_optimize(256, 512), false);
+///
+/// // Large allocation - alignment beneficial
+/// assert_eq!(should_optimize(1024, 512), true);
+/// ```
+pub fn should_optimize(size: usize, alignment: usize) -> bool {
+    size >= alignment
+}

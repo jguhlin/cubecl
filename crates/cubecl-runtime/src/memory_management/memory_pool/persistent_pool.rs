@@ -8,7 +8,9 @@ use cubecl_common::backtrace::BackTrace;
 use hashbrown::HashMap;
 
 pub struct PersistentPool {
-    slices: Vec<Slice>,
+    /// Slices stored as Option to support tombstone-based deallocation.
+    /// This keeps slice indices stable so outstanding bindings remain valid.
+    slices: Vec<Option<Slice>>,
     sizes: HashMap<u64, Vec<usize>>,
     alignment: u64,
     max_alloc_size: u64,
@@ -23,12 +25,12 @@ impl core::fmt::Display for PersistentPool {
             let total = positions.len();
 
             for pos in positions {
-                let slice = &self.slices[*pos];
-                let is_free = slice.is_free();
-                if is_free {
-                    num_free += 1;
-                } else {
-                    num_full += 1;
+                if let Some(slice) = &self.slices[*pos] {
+                    if slice.is_free() {
+                        num_free += 1;
+                    } else {
+                        num_full += 1;
+                    }
                 }
             }
 
@@ -74,9 +76,14 @@ impl MemoryPool for PersistentPool {
 
         self.slices
             .get(slice_index)
+            .and_then(|s| s.as_ref())
             .ok_or_else(|| IoError::NotFound {
                 backtrace: BackTrace::capture(),
-                reason: alloc::format!("Memory slice {} doesn't exist", slice_index).into(),
+                reason: alloc::format!(
+                    "PersistentPool: slice {} doesn't exist (tombstone or out of range)",
+                    slice_index
+                )
+                .into(),
             })
     }
 
@@ -86,12 +93,12 @@ impl MemoryPool for PersistentPool {
 
         if let Some(positions) = self.sizes.get_mut(&effective_size) {
             for pos in positions {
-                let slice = &mut self.slices[*pos];
-
-                if slice.is_free() {
-                    slice.storage.utilization.size = size;
-                    slice.storage.utilization.offset = 0;
-                    return Some(slice.handle.clone());
+                if let Some(slice) = &mut self.slices[*pos] {
+                    if slice.is_free() {
+                        slice.storage.utilization.size = size;
+                        slice.storage.utilization.offset = 0;
+                        return Some(slice.handle.clone());
+                    }
                 }
             }
         }
@@ -111,7 +118,15 @@ impl MemoryPool for PersistentPool {
         let mut slice = Slice::new(storage_handle, padding);
         slice.storage.utilization = StorageUtilization { offset: 0, size };
         let slice_id = slice.descriptor();
-        let slice_pos = self.slices.len();
+
+        // Find a tombstone slot or append.
+        let slice_pos = if let Some(idx) = self.slices.iter().position(|s| s.is_none()) {
+            idx
+        } else {
+            self.slices.push(None);
+            self.slices.len() - 1
+        };
+
         let mut location = self.location_base;
         location.slice = slice_pos as u32;
         slice_id.update_location(location);
@@ -126,7 +141,7 @@ impl MemoryPool for PersistentPool {
         }
 
         let handle = slice.handle.clone();
-        self.slices.push(slice);
+        self.slices[slice_pos] = Some(slice);
 
         Ok(handle)
     }
@@ -135,6 +150,7 @@ impl MemoryPool for PersistentPool {
         let used_slices: Vec<_> = self
             .slices
             .iter()
+            .filter_map(|s| s.as_ref())
             .filter(|slice| !slice.is_free())
             .collect();
 
@@ -142,7 +158,12 @@ impl MemoryPool for PersistentPool {
             number_allocs: used_slices.len() as u64,
             bytes_in_use: used_slices.iter().map(|slice| slice.storage.size()).sum(),
             bytes_padding: used_slices.iter().map(|slice| slice.padding).sum(),
-            bytes_reserved: self.slices.iter().map(|slice| slice.effective_size()).sum(),
+            bytes_reserved: self
+                .slices
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|slice| slice.effective_size())
+                .sum(),
         }
     }
 
@@ -153,32 +174,38 @@ impl MemoryPool for PersistentPool {
         explicit: bool,
     ) {
         if explicit {
-            // We have to recompute all locations, so it's just safer to rebuild everything.
-            let mut slices = Vec::new();
+            // Deallocate free slices in-place using tombstones to keep indices stable.
+            for slot in self.slices.iter_mut() {
+                let dealloc_id = slot
+                    .as_ref()
+                    .filter(|slice| slice.is_free())
+                    .map(|slice| slice.storage.id);
+                if let Some(id) = dealloc_id {
+                    storage.dealloc(id);
+                    *slot = None; // tombstone
+                }
+            }
+
+            // Rebuild sizes map to exclude tombstoned positions.
             let mut sizes = HashMap::<u64, Vec<usize>>::new();
-
-            for slice in self.slices.drain(..) {
-                if slice.is_free() {
-                    storage.dealloc(slice.storage.id);
-                } else {
-                    let slice_pos = slices.len();
+            for (i, slot) in self.slices.iter().enumerate() {
+                if let Some(slice) = slot {
                     let effective_size = slice.effective_size();
-                    slice.descriptor().update_slice(slice_pos as u32);
-                    slices.push(slice);
-
                     match sizes.get_mut(&effective_size) {
-                        Some(vals) => {
-                            vals.push(slice_pos);
-                        }
+                        Some(vals) => vals.push(i),
                         None => {
-                            sizes.insert(effective_size, vec![slice_pos]);
+                            sizes.insert(effective_size, vec![i]);
                         }
                     }
                 }
             }
-
             self.sizes = sizes;
-            self.slices = slices;
+
+            // Trim trailing tombstones.
+            while self.slices.last().map_or(false, |s| s.is_none()) {
+                self.slices.pop();
+            }
+
             storage.flush();
         }
     }
@@ -189,7 +216,20 @@ impl MemoryPool for PersistentPool {
         new: ManagedMemoryHandle,
         cursor: u64,
     ) -> Result<(), IoError> {
-        let slice = &mut self.slices[old.descriptor().slice()];
+        let slice_index = old.descriptor().slice();
+        let slice = self
+            .slices
+            .get_mut(slice_index)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: alloc::format!(
+                    "PersistentPool: slice {} doesn't exist for bind",
+                    slice_index
+                )
+                .into(),
+            })?;
+
         new.descriptor()
             .update_location(old.descriptor().location());
         slice.cursor = cursor;

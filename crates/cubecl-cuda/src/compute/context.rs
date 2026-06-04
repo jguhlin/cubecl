@@ -24,8 +24,7 @@ use cudarc::driver::DriverError;
 use cudarc::driver::sys::CUfunc_st;
 use cudarc::driver::sys::{CUctx_st, CUfunction_attribute, CUtensorMap};
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::ffi::c_char;
+use std::ffi::{CString, c_char, c_int};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{ffi::CStr, os::raw::c_void};
@@ -113,6 +112,7 @@ impl CudaContext {
                     entry.entrypoint_name.clone(),
                     kernel_id.cube_dim,
                     entry.shared_mem_bytes,
+                    "cache",
                 )?;
                 return Ok(());
             }
@@ -144,7 +144,7 @@ impl CudaContext {
         }
 
         let cube_dim = kernel_compiled.cube_dim;
-        let arch = if self.arch.version >= 90 {
+        let arch = if self.arch.version > 90 {
             format!("--gpu-architecture=sm_{}a", self.arch)
         } else {
             format!("--gpu-architecture=sm_{}", self.arch)
@@ -232,6 +232,7 @@ impl CudaContext {
             kernel_compiled.entrypoint_name,
             cube_dim,
             repr.shared_memory_size(),
+            &options.join(","),
         )?;
         Ok(())
     }
@@ -243,6 +244,7 @@ impl CudaContext {
         entrypoint_name: String,
         cube_dim: CubeDim,
         shared_mem_bytes: usize,
+        compile_options: &str,
     ) -> Result<(), CompilationError> {
         let func_name = CString::new(entrypoint_name).unwrap();
         // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
@@ -250,7 +252,11 @@ impl CudaContext {
         let func = unsafe {
             let module = cudarc::driver::result::module::load_data(ptx.as_ptr() as *const _)
                 .map_err(|err| CompilationError::Generic {
-                    reason: format!("Unable to load the PTX: {err}"),
+                    reason: format!(
+                        "Unable to load the PTX: {err:?}; compile_options={compile_options}; {}; {}",
+                        nvrtc_version_summary(),
+                        ptx_header_summary(&ptx)
+                    ),
                     backtrace: BackTrace::capture(),
                 })?;
 
@@ -340,5 +346,33 @@ impl CudaContext {
         } else {
             Ok(())
         }
+    }
+}
+
+fn nvrtc_version_summary() -> String {
+    let mut major: c_int = 0;
+    let mut minor: c_int = 0;
+    // SAFETY: NVRTC version query only writes two integer outputs and does not depend on a program.
+    match unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor).result() } {
+        Ok(()) => format!("nvrtc={major}.{minor}"),
+        Err(err) => format!("nvrtc_version_error={err:?}"),
+    }
+}
+
+fn ptx_header_summary(ptx: &[c_char]) -> String {
+    let bytes: Vec<u8> = ptx.iter().map(|byte| *byte as u8).take(2048).collect();
+    let text = String::from_utf8_lossy(&bytes);
+    let fields: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            line.starts_with(".version")
+                || line.starts_with(".target")
+                || line.starts_with(".address_size")
+        })
+        .collect();
+    if fields.is_empty() {
+        "ptx_header=<unavailable>".to_string()
+    } else {
+        format!("ptx_header={}", fields.join("; "))
     }
 }

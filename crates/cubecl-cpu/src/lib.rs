@@ -8,13 +8,14 @@ extern crate alloc;
 mod tests {
     pub type TestRuntime = crate::CpuRuntime;
 
-    pub use half::f16;
+    pub use half::{bf16, f16};
 
     use cubecl_core as cubecl;
     use cubecl_core::prelude::*;
 
     cubecl_core::testgen_all!(f32: [f16, f32, f64], i32: [i8, i16, i32, i64], u32: [u8, u16, u32, u64]);
     cubecl_std::testgen!();
+    cubecl_std::testgen_array_inline_indexing_bf16!();
     cubecl_std::testgen_tensor_identity!([f16, f32, u32]);
     cubecl_std::testgen_quantized_view!(f32);
 
@@ -82,9 +83,10 @@ mod tests {
                 CubeDim::new_1d(1),
                 BufferArg::from_raw_parts(out.clone(), 1),
             )
+            .unwrap();
         }
 
-        let bytes = client.read_one_unchecked(out);
+        let bytes = client.read_one(out);
         let actual = f32::from_bytes(&bytes);
         assert_eq!(actual[0], 1.0);
     }
@@ -101,9 +103,10 @@ mod tests {
                 CubeDim::new_1d(4),
                 BufferArg::from_raw_parts(out.clone(), 4),
             )
+            .unwrap();
         }
 
-        let bytes = client.read_one_unchecked(out);
+        let bytes = client.read_one(out);
         let actual = u32::from_bytes(&bytes);
         assert_eq!(actual, &[0xDEADBEEF; 4]);
     }
@@ -120,9 +123,10 @@ mod tests {
                 CubeDim::new_1d(4),
                 BufferArg::from_raw_parts(out.clone(), 4),
             )
+            .unwrap();
         }
 
-        let bytes = client.read_one_unchecked(out);
+        let bytes = client.read_one(out);
         let actual = u32::from_bytes(&bytes);
         assert_eq!(actual, &[10u32; 4]);
     }
@@ -139,9 +143,10 @@ mod tests {
                 CubeDim::new_1d(8),
                 BufferArg::from_raw_parts(out.clone(), 8),
             )
+            .unwrap();
         }
 
-        let bytes = client.read_one_unchecked(out);
+        let bytes = client.read_one(out);
         let actual = u32::from_bytes(&bytes);
         assert_eq!(actual, &[28u32; 8]);
     }

@@ -513,6 +513,7 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for HipDialect<M> {
     fn compile_warp_shuffle(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         source: &str,
     ) -> std::fmt::Result {
         write!(f, "__shfl({var}, {source})")
@@ -534,6 +535,7 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for HipDialect<M> {
     fn compile_warp_shuffle_up(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
         write!(f, "__shfl_up({var}, {offset})")
@@ -541,6 +543,7 @@ impl<M: DialectWmmaCompiler<Self>> DialectInstructions<Self> for HipDialect<M> {
     fn compile_warp_shuffle_down(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
         write!(f, "__shfl_down({var}, {offset})")

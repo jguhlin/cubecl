@@ -316,10 +316,11 @@ impl<D: Dialect> Display for Instruction<D> {
             } => {
                 let item = Item::new(out.elem(), *vector_size as usize);
                 let addr_space = D::address_space_for_variable(input);
+                let qualifier = input.const_qualifier();
 
                 writeln!(
                     f,
-                    "{addr_space}{item} *{out} = reinterpret_cast<{item}*>({input});"
+                    "{addr_space}{item}{qualifier} *{out} = reinterpret_cast<{item}{qualifier}*>({input});"
                 )
             }
             Instruction::Mul(it) => Mul::format(f, &it.lhs, &it.rhs, &it.out),

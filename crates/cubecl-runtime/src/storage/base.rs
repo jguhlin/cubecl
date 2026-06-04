@@ -45,9 +45,11 @@ impl StorageHandle {
 
     /// Increase the current offset with the given value in bytes.
     pub fn offset_start(&self, offset_bytes: u64) -> Self {
+        let available = self.size();
+        let clamped = offset_bytes.min(available);
         let utilization = StorageUtilization {
-            offset: self.offset() + offset_bytes,
-            size: self.size() - offset_bytes,
+            offset: self.offset() + clamped,
+            size: available - clamped,
         };
 
         Self {
@@ -58,9 +60,11 @@ impl StorageHandle {
 
     /// Reduce the size of the memory handle..
     pub fn offset_end(&self, offset_bytes: u64) -> Self {
+        let available = self.size();
+        let clamped = offset_bytes.min(available);
         let utilization = StorageUtilization {
             offset: self.offset(),
-            size: self.size() - offset_bytes,
+            size: available - clamped,
         };
 
         Self {
@@ -92,6 +96,30 @@ pub trait ComputeStorage: Send {
 
     /// Flush deallocations when required.
     fn flush(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_handle_offsets_clamp_without_underflow() {
+        let handle = StorageHandle {
+            id: StorageId { value: 1 },
+            utilization: StorageUtilization {
+                offset: 0,
+                size: 16,
+            },
+        };
+
+        let end = handle.offset_end(64);
+        assert_eq!(end.size(), 0);
+        assert_eq!(end.offset(), 0);
+
+        let start = handle.offset_start(64);
+        assert_eq!(start.size(), 0);
+        assert_eq!(start.offset(), 16);
+    }
 }
 
 /// Access to the underlying resource.

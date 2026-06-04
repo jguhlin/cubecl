@@ -49,6 +49,23 @@ fn search_loop(func: &mut Function, state: &GlobalState) -> bool {
         visit_noop,
     );
 
+    // Treat values directly derived from kernel buffers as live to avoid removing
+    // argument binding work that only survives through optimized branches.
+    let mut func_arg_vars = HashSet::new();
+    for node in nodes.iter() {
+        for op in func[*node].ops.borrow().values() {
+            if let Some(out) = op.out {
+                let uses_global_buffer = op.operation.args().is_some_and(|args| {
+                    args.iter()
+                        .any(|v| matches!(v.kind, VariableKind::GlobalBuffer(_)))
+                });
+                if uses_global_buffer {
+                    func_arg_vars.insert(out);
+                }
+            }
+        }
+    }
+
     for node in nodes {
         let phi = func.block(node).phi_nodes.borrow().clone();
         let filtered_phi = phi
@@ -72,6 +89,18 @@ fn search_loop(func: &mut Function, state: &GlobalState) -> bool {
             if !matches!(out.kind, VariableKind::GlobalBuffer(_))
                 && !var_used.borrow().contains(&out)
             {
+                if func_arg_vars.contains(&out) {
+                    continue;
+                }
+
+                let uses_func_arg = op
+                    .operation
+                    .args()
+                    .is_some_and(|args| args.iter().any(|v| func_arg_vars.contains(v)));
+                if uses_func_arg {
+                    continue;
+                }
+
                 func[node].ops.borrow_mut().remove(idx);
                 contains_modification = true;
             }

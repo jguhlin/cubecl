@@ -45,6 +45,7 @@ pub(crate) fn index_expand(
     checked: bool,
 ) -> Variable {
     let item_lhs = list.value_type();
+    let vec = vector_size.unwrap_or_else(|| item_lhs.vector_size());
 
     let ty = if let Some(vector_size) = vector_size {
         item_lhs.with_vector_size(vector_size)
@@ -58,7 +59,7 @@ pub(crate) fn index_expand(
     let op = Memory::Index(IndexOperands {
         list,
         index,
-        vector_size: vector_size.unwrap_or(0),
+        vector_size: vec,
         unroll_factor: 1,
         checked,
     });

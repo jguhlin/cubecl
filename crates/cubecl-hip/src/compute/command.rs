@@ -313,6 +313,9 @@ impl<'a> Command<'a> {
         };
 
         current.drop_queue.push(data);
+        if current.drop_queue.should_flush() {
+            current.drop_queue.flush(|| Fence::new(current.sys));
+        }
 
         Ok(())
     }
@@ -488,6 +491,28 @@ pub(crate) unsafe fn write_to_cpu(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn writes_flush_upload_drop_queue_when_threshold_trips() {
+        let source = include_str!("command.rs");
+        let write_to_gpu = source
+            .split_once("pub fn write_to_gpu(&mut self, descriptor: CopyDescriptor, data: Bytes)")
+            .and_then(|(_, tail)| {
+                tail.split_once("pub fn create_with_data")
+                    .map(|(head, _)| head)
+            })
+            .expect("write_to_gpu source");
+
+        assert!(write_to_gpu.contains("current.drop_queue.push(data);"));
+        assert!(write_to_gpu.contains("if current.drop_queue.should_flush()"));
+        assert!(
+            write_to_gpu.contains("current.drop_queue.flush(|| Fence::new(current.sys));"),
+            "upload writes must not retain all pinned staging until a later kernel/cleanup"
+        );
+    }
 }
 
 /// Asynchronously copies data from host memory to GPU device memory.

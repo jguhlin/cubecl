@@ -16,7 +16,6 @@ use cubecl_core::ir::{
     self as gpu, ConstantValue, Matrix, MatrixIdent,
     features::{MmaConfig, ScaledMmaConfig},
 };
-use itertools::Itertools;
 use std::fmt::Display;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -695,35 +694,9 @@ pub(super) fn supported_mma_combinations(arch: &CudaArchitecture) -> SupportedMm
             // TODO: u4/i4/b1, there's no types for them yet
         ]);
     }
-    if arch.get_version() >= 89 {
-        let f8f6f4_types = [
-            gpu::FloatKind::E4M3,
-            gpu::FloatKind::E5M2,
-            gpu::FloatKind::E3M2,
-            gpu::FloatKind::E2M3,
-            gpu::FloatKind::E2M1,
-        ];
-        let combinations = f8f6f4_types.iter().cartesian_product(f8f6f4_types.iter());
-        result.extend(combinations.map(|(t1, t2)| MmaConfig {
-            a_type: gpu::ElemType::Float(*t1).into(),
-            b_type: gpu::ElemType::Float(*t2).into(),
-            cd_type: gpu::ElemType::Float(gpu::FloatKind::F32).into(),
-            m: 16,
-            n: 8,
-            k: 32,
-        }));
-    }
-    // Warning: this likely does not follow the same layout pattern as those after 80
-    if arch.get_version() >= 70 && arch.get_version() < 80 {
-        result.push(MmaConfig {
-            a_type: gpu::ElemType::Float(gpu::FloatKind::F16).into(),
-            b_type: gpu::ElemType::Float(gpu::FloatKind::F16).into(),
-            cd_type: gpu::ElemType::Float(gpu::FloatKind::F32).into(),
-            m: 16,
-            n: 8,
-            k: 8,
-        });
-    }
+    // NOTE: Manual MMA is implemented with `mma.sync` PTX. The fp8/fp6/fp4 type combinations are
+    // not accepted by `ptxas` on current targets/toolchains (e.g. SM90). Until we have a
+    // wgmma-based implementation, don't claim support for these combinations.
     result
 }
 

@@ -60,6 +60,28 @@ impl<'a> Command<'a> {
             .get_resource(binding.memory, binding.offset_start, binding.offset_end)
     }
 
+    /// Upload kernel metadata to the per-stream staging buffer and return a
+    /// [`GpuResource`] that can be passed directly to the kernel launch.
+    ///
+    /// This bypasses the memory management system entirely, avoiding any GPU
+    /// memory allocation. Safe for use during CUDA graph capture.
+    pub fn upload_metadata(&mut self, data: &[u8]) -> Result<GpuResource, IoError> {
+        let stream = self.streams.current();
+        let cu_stream = stream.sys;
+        stream.metadata_staging.upload(data, cu_stream)?;
+        let gpu_ptr = stream.metadata_staging.gpu_ptr();
+        let binding = stream.metadata_staging.gpu_ptr_binding();
+        Ok(GpuResource::new(gpu_ptr, binding, data.len() as u64))
+    }
+
+    /// Switches the current CUDA context to the one associated with this command.
+    ///
+    /// Users should not make calls to other [`Command`]s while the context is switched.
+    #[allow(dead_code)]
+    pub fn unsafe_set_current(&self) {
+        self.ctx.unsafe_set_current().unwrap();
+    }
+
     /// Get the stream cursor.
     pub fn cursor(&self) -> u64 {
         self.streams.cursor
@@ -105,6 +127,7 @@ impl<'a> Command<'a> {
         Ok(handle)
     }
 
+    #[allow(dead_code)]
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn empty(&mut self, size: u64) -> Result<Handle, IoError> {
         let handle = Handle::new(self.streams.current, size);
@@ -117,11 +140,18 @@ impl<'a> Command<'a> {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     pub fn bind(&mut self, reserved: ManagedMemoryHandle, new: ManagedMemoryHandle) {
         let cursor = self.cursor();
+        let reserved_debug = reserved.debug_summary();
+        let new_debug = new.debug_summary();
         self.streams
             .current()
             .memory_management_gpu
             .bind(reserved, new, cursor)
-            .unwrap();
+            .unwrap_or_else(|err| {
+                panic!(
+                    "cubecl command bind failed: reserved=[{}] assigned=[{}] cursor={} err={}",
+                    reserved_debug, new_debug, cursor, err
+                )
+            });
     }
 
     /// Creates a [Bytes] instance from pinned memory, if suitable for the given size.
@@ -166,6 +196,15 @@ impl<'a> Command<'a> {
             .memory_management_cpu
             .get_resource(binding.clone(), None, None)
             .ok()?;
+        if resource.ptr.is_null() || resource.size < size {
+            log::warn!(
+                "[CUBECL] reserve_pinned invalid host resource: requested_size={} ptr_null={} resource_size={}",
+                size,
+                resource.ptr.is_null(),
+                resource.size,
+            );
+            return None;
+        }
 
         let controller = Box::new(PinnedMemoryManagedAllocController::init(binding, resource));
         // SAFETY: The binding has initialized memory for at least `size` bytes.
@@ -191,16 +230,33 @@ impl<'a> Command<'a> {
             .iter()
             .map(|b| b.handle.clone())
             .collect::<Vec<_>>();
-
-        let result = self.copies_to_bytes(descriptors, true);
-        let fence = Fence::new(self.streams.current().sys);
+        let stream = self.streams.current().sys;
+        let capture_status = unsafe {
+            cudarc::driver::result::stream::is_capturing(stream).unwrap_or(
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+            )
+        };
+        let result = if capture_status
+            == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            self.copies_to_bytes(descriptors, true)
+                .map_err(ServerError::from)
+        } else {
+            Err(ServerError::Generic {
+                reason: format!(
+                    "CUDA stream capture is active; refusing CubeCL read_async on captured stream (status={capture_status:?})"
+                ),
+                backtrace: BackTrace::capture(),
+            })
+        };
+        let fence = result.as_ref().ok().map(|_| Fence::new(stream));
 
         async move {
-            let sync = fence.wait_sync();
-            // Release memory handle.
+            if let Some(fence) = fence {
+                fence.wait_sync()?;
+            }
+            // Release memory handle after the stream reaches the read fence.
             core::mem::drop(descriptors_moved);
-
-            sync?;
             let bytes = result?;
 
             Ok(bytes)
@@ -385,6 +441,21 @@ impl<'a> Command<'a> {
         }?;
 
         current.drop_queue.push(data);
+        if current.drop_queue.should_flush() {
+            // During CUDA stream capture, creating/synchronizing events is illegal
+            // and would invalidate the capture. Uploads normally happen outside
+            // capture, but keep the same guard as kernel launches.
+            let capturing = unsafe {
+                cudarc::driver::result::stream::is_capturing(current.sys).unwrap_or(
+                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+                )
+            };
+            if capturing
+                == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+            {
+                current.drop_queue.flush(|| Fence::new(current.sys));
+            }
+        }
 
         Ok(())
     }
@@ -399,6 +470,7 @@ impl<'a> Command<'a> {
     ///
     /// * `Ok(Handle)` - A handle to the newly allocated and populated GPU memory.
     /// * `Err(IoError)` - If the allocation or data copy fails.
+    #[allow(dead_code)]
     pub fn create_with_data(&mut self, data: &[u8]) -> Result<Handle, IoError> {
         let mut staging =
             self.reserve_pinned(data.len(), None)
@@ -430,7 +502,26 @@ impl<'a> Command<'a> {
     ///
     /// * A `DynFut<()>` future that resolves when the stream is synchronized.
     pub fn sync(&mut self) -> DynFut<Result<(), ServerError>> {
-        let fence = Fence::new(self.streams.current().sys);
+        let stream = self.streams.current().sys;
+        let capture_status = unsafe {
+            cudarc::driver::result::stream::is_capturing(stream).unwrap_or(
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+            )
+        };
+        if capture_status
+            != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            return Box::pin(async move {
+                Err(ServerError::Generic {
+                    reason: format!(
+                        "CUDA stream capture is active; refusing CubeCL sync on captured stream (status={capture_status:?})"
+                    ),
+                    backtrace: BackTrace::capture(),
+                })
+            });
+        }
+
+        let fence = Fence::new(stream);
 
         Box::pin(async { fence.wait_sync() })
     }
@@ -479,7 +570,18 @@ impl<'a> Command<'a> {
         );
 
         if stream.drop_queue.should_flush() {
-            stream.drop_queue.flush(|| Fence::new(stream.sys));
+            // During CUDA stream capture, creating/synchronizing events is illegal
+            // and would invalidate the capture. Defer the flush until capture ends.
+            let capturing = unsafe {
+                cudarc::driver::result::stream::is_capturing(stream.sys).unwrap_or(
+                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+                )
+            };
+            if capturing
+                == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+            {
+                stream.drop_queue.flush(|| Fence::new(stream.sys));
+            }
         }
 
         if let Err(err) = result {
@@ -659,5 +761,45 @@ pub(crate) unsafe fn write_to_cpu(
                     backtrace: BackTrace::capture(),
                 })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn read_and_sync_refuse_cuda_stream_capture() {
+        let source = include_str!("command.rs");
+
+        assert!(
+            source.contains("refusing CubeCL read_async on captured stream"),
+            "read_async must fail before recording a CUDA event during stream capture"
+        );
+        assert!(
+            source.contains("refusing CubeCL sync on captured stream"),
+            "sync must fail before recording a CUDA event during stream capture"
+        );
+        assert!(
+            source.contains("CU_STREAM_CAPTURE_STATUS_NONE"),
+            "capture guards should check CUDA stream capture status explicitly"
+        );
+    }
+
+    #[test]
+    fn writes_flush_upload_drop_queue_when_threshold_trips() {
+        let source = include_str!("command.rs");
+        let write_to_gpu = source
+            .split_once("pub fn write_to_gpu(&mut self, descriptor: CopyDescriptor, data: Bytes)")
+            .and_then(|(_, tail)| {
+                tail.split_once("pub fn create_with_data")
+                    .map(|(head, _)| head)
+            })
+            .expect("write_to_gpu source");
+
+        assert!(write_to_gpu.contains("current.drop_queue.push(data);"));
+        assert!(write_to_gpu.contains("if current.drop_queue.should_flush()"));
+        assert!(
+            write_to_gpu.contains("current.drop_queue.flush(|| Fence::new(current.sys));"),
+            "upload writes must not retain all pinned staging until a later kernel/cleanup"
+        );
     }
 }

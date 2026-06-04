@@ -976,6 +976,7 @@ impl DialectInstructions<Self> for MslDialect {
     fn compile_warp_shuffle(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         source: &str,
     ) -> std::fmt::Result {
         write!(f, "simd_shuffle({var}, {source})")
@@ -993,6 +994,7 @@ impl DialectInstructions<Self> for MslDialect {
     fn compile_warp_shuffle_up(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
         write!(f, "simd_shuffle_up({var}, {offset})")
@@ -1001,6 +1003,7 @@ impl DialectInstructions<Self> for MslDialect {
     fn compile_warp_shuffle_down(
         f: &mut std::fmt::Formatter<'_>,
         var: &str,
+        _elem: &Elem<Self>,
         offset: &str,
     ) -> std::fmt::Result {
         write!(f, "simd_shuffle_down({var}, {offset})")

@@ -14,9 +14,10 @@ use super::{ManagedMemoryBinding, ManagedMemoryHandle, MemoryPool, Slice, calcul
 /// - Only one slice is supported per page, due to the limitations in WGPU where each buffer should only bound with
 ///   either read only or `read_write` slices but not a mix of both.
 /// - The pool uses a ring buffer to efficiently manage and reuse pages.
+/// - Pages use tombstone-based deallocation (Option<MemoryPage>) to keep page indices
+///   stable. This prevents index invalidation for outstanding bindings.
 pub struct ExclusiveMemoryPool {
-    pages: Vec<MemoryPage>,
-    pages_tmp: Vec<MemoryPage>,
+    pages: Vec<Option<MemoryPage>>,
     alignment: u64,
     dealloc_period: u64,
     last_dealloc_check: u64,
@@ -32,14 +33,15 @@ impl core::fmt::Display for ExclusiveMemoryPool {
             BytesFormat::new(self.max_alloc_size)
         ))?;
 
-        for page in self.pages.iter() {
-            let is_free = page.slice.is_free();
-            let size = BytesFormat::new(page.slice.effective_size());
-
-            f.write_fmt(format_args!("   - Page {size} is_free={is_free}\n"))?;
+        for (i, slot) in self.pages.iter().enumerate() {
+            if let Some(page) = slot {
+                let is_free = page.slice.is_free();
+                let size = BytesFormat::new(page.slice.effective_size());
+                f.write_fmt(format_args!("   - Page[{i}] {size} is_free={is_free}\n"))?;
+            }
         }
 
-        if !self.pages.is_empty() {
+        if self.pages.iter().any(|s| s.is_some()) {
             f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))?;
         }
 
@@ -70,7 +72,6 @@ impl ExclusiveMemoryPool {
 
         Self {
             pages: Vec::new(),
-            pages_tmp: Vec::new(),
             alignment,
             dealloc_period,
             last_dealloc_check: 0,
@@ -86,6 +87,7 @@ impl ExclusiveMemoryPool {
         // Return the smallest free page that fits.
         self.pages
             .iter_mut()
+            .filter_map(|slot| slot.as_mut())
             .filter(|page| page.alloc_size >= size && page.slice.is_free())
             .min_by_key(|page| page.free_count)
     }
@@ -109,16 +111,24 @@ impl ExclusiveMemoryPool {
         slice.storage.utilization = StorageUtilization { offset: 0, size };
         slice.padding = padding;
 
-        self.pages.push(MemoryPage {
+        let page = MemoryPage {
             slice,
             alloc_size,
             // Start the allocation at 'almost ready to free'. Every use will decrement this.
             // This means allocations start as "suspected as unused" and over time will be kept for longer.
             free_count: ALLOC_AFTER_FREE - 1,
-        });
+        };
 
-        let idx = self.pages.len() - 1;
-        Ok((idx, &mut self.pages[idx]))
+        // Reuse a tombstone slot if available to keep the pages array compact.
+        let idx = if let Some(tombstone_idx) = self.pages.iter().position(|s| s.is_none()) {
+            self.pages[tombstone_idx] = Some(page);
+            tombstone_idx
+        } else {
+            self.pages.push(Some(page));
+            self.pages.len() - 1
+        };
+
+        Ok((idx, self.pages[idx].as_mut().unwrap()))
     }
 }
 
@@ -138,8 +148,6 @@ impl MemoryPool for ExclusiveMemoryPool {
         let padding = calculate_padding(size, self.alignment);
 
         self.get_free_page(size).map(|page| {
-            // Return a smaller part of the slice. By construction, we only ever
-            // get a page with a big enough size, so this is ok to do.
             page.slice.storage.utilization = StorageUtilization { offset: 0, size };
             page.slice.padding = padding;
             page.free_count = page.free_count.saturating_sub(1);
@@ -176,6 +184,7 @@ impl MemoryPool for ExclusiveMemoryPool {
         let used_slices: Vec<_> = self
             .pages
             .iter()
+            .filter_map(|slot| slot.as_ref())
             .filter(|page| !page.slice.is_free())
             .collect();
 
@@ -186,7 +195,12 @@ impl MemoryPool for ExclusiveMemoryPool {
                 .map(|page| page.slice.storage.size())
                 .sum(),
             bytes_padding: used_slices.iter().map(|page| page.slice.padding).sum(),
-            bytes_reserved: self.pages.iter().map(|page| page.alloc_size).sum(),
+            bytes_reserved: self
+                .pages
+                .iter()
+                .filter_map(|slot| slot.as_ref())
+                .map(|page| page.alloc_size)
+                .sum(),
         }
     }
 
@@ -202,27 +216,26 @@ impl MemoryPool for ExclusiveMemoryPool {
         if explicit || alloc_nr - self.last_dealloc_check >= check_period {
             self.last_dealloc_check = alloc_nr;
 
-            for mut page in self.pages.drain(..) {
-                if page.slice.is_free() {
-                    page.free_count += 1;
+            // Deallocate in-place using tombstones (None) to keep page indices
+            // stable. This prevents invalidation of outstanding bindings that
+            // reference pages by index.
+            for slot in self.pages.iter_mut() {
+                if let Some(page) = slot.as_mut() {
+                    if page.slice.is_free() {
+                        page.free_count += 1;
 
-                    // If free found is sufficiently high (ie. we've seen this alloc as free multiple times,
-                    // without it being used in the meantime), deallocate it.
-                    if page.free_count >= ALLOC_AFTER_FREE || explicit {
-                        storage.dealloc(page.slice.storage.id);
-                        continue;
+                        if page.free_count >= ALLOC_AFTER_FREE || explicit {
+                            storage.dealloc(page.slice.storage.id);
+                            *slot = None; // tombstone — index stays stable
+                        }
                     }
                 }
-
-                let page_index = self.pages_tmp.len();
-                page.slice
-                    .handle
-                    .descriptor()
-                    .update_page(page_index as u16);
-                self.pages_tmp.push(page);
             }
 
-            core::mem::swap(&mut self.pages, &mut self.pages_tmp);
+            // Trim trailing tombstones to avoid unbounded growth.
+            while self.pages.last().map_or(false, |s| s.is_none()) {
+                self.pages.pop();
+            }
         }
     }
 
@@ -233,9 +246,21 @@ impl MemoryPool for ExclusiveMemoryPool {
         cursor: u64,
     ) -> Result<(), IoError> {
         let id_old = old.descriptor();
-        let page = &mut self.pages[id_old.page()];
-        new.descriptor().update_location(id_old.location());
+        let page_index = id_old.page();
+        let page = self
+            .pages
+            .get_mut(page_index)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: alloc::format!(
+                    "Memory page {} doesn't exist (tombstone or out of range)",
+                    page_index
+                )
+                .into(),
+            })?;
 
+        new.descriptor().update_location(id_old.location());
         page.slice.handle = new;
         page.slice.cursor = cursor;
 
@@ -249,9 +274,14 @@ impl MemoryPool for ExclusiveMemoryPool {
         let page = self
             .pages
             .get(page_index)
+            .and_then(|s| s.as_ref())
             .ok_or_else(|| IoError::NotFound {
                 backtrace: BackTrace::capture(),
-                reason: alloc::format!("Memory page {} doesn't exist", page_index).into(),
+                reason: alloc::format!(
+                    "Memory page {} doesn't exist (tombstone or out of range)",
+                    page_index
+                )
+                .into(),
             })?;
 
         Ok(&page.slice)

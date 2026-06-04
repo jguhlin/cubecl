@@ -209,6 +209,16 @@ impl<B: EventStreamBackend> MultiStream<B> {
         self.gc.sender.send(gc).unwrap();
     }
 
+    /// Calls `func` on every backend stream that has been initialized.
+    ///
+    /// Only visits slots already created; does not lazily initialize new streams.
+    /// Use this for bulk operations such as cleaning all stream memory pools on
+    /// model unload, where allocations may have landed on different thread streams.
+    pub fn for_each_stream_initialized<Func: FnMut(&mut B::Stream)>(&mut self, mut func: Func) {
+        self.streams
+            .for_each_initialized(|wrapper| func(&mut wrapper.stream));
+    }
+
     /// Resolves and returns a mutable reference to the stream for the given ID, performing any necessary
     /// alignment based on the provided bindings.
     ///

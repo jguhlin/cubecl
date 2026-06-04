@@ -127,6 +127,14 @@ pub(crate) fn special_cast<D: Dialect>(
         return cast_to_fp8(f, current_in, *out);
     }
 
+    // F16 cannot be directly cast to BF16 in CUDA (no __nv_bfloat16(__half) constructor).
+    // Use __float2bfloat16(__half2float(x)) for each component.
+    if matches!(current_in.elem(), Elem::F16 | Elem::F16x2)
+        && matches!(out.elem(), Elem::BF16 | Elem::BF16x2)
+    {
+        return cast_half_to_bfloat(f, current_in, *out);
+    }
+
     if current_in.item() != out.item() {
         let assign = Instruction::Assign(UnaryInstruction {
             input: current_in,
@@ -307,6 +315,32 @@ fn cast_minifloat_to_half<D: Dialect>(
             out_opt.elem()
         )
     })
+}
+
+/// Convert F16 to BF16 via float: __float2bfloat16(__half2float(x))
+fn cast_half_to_bfloat<D: Dialect>(
+    f: &mut fmt::Formatter,
+    input: Variable<D>,
+    out: Variable<D>,
+) -> fmt::Result {
+    let out_item = out.item();
+    let vec = out_item.vectorization();
+
+    write!(f, "{} = ", out.fmt_left())?;
+    if vec > 1 {
+        writeln!(f, "{out_item} {{")?;
+    }
+    for i in 0..vec {
+        let comp = input.index(i);
+        write!(f, "__float2bfloat16(__half2float({comp}))")?;
+        if i + 1 < vec {
+            f.write_str(",\n")?;
+        }
+    }
+    if vec > 1 {
+        write!(f, "\n}}")?;
+    }
+    f.write_str(";\n")
 }
 
 /// Convert an e8m0 scaling factor to bf16

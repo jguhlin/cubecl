@@ -189,6 +189,25 @@ enum MemoryAllocationOption {
 }
 
 impl<Storage: ComputeStorage> MemoryManagement<Storage> {
+    fn ensure_initialized_reservation(
+        handle: ManagedMemoryHandle,
+        source: &str,
+    ) -> Result<ManagedMemoryHandle, IoError> {
+        if handle.descriptor().location().init == 0 {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: format!(
+                    "reserve returned uninitialized handle via {} | {}",
+                    source,
+                    handle.debug_summary()
+                )
+                .into(),
+            });
+        }
+
+        Ok(handle)
+    }
+
     /// Creates the options from device limits.
     pub fn from_configuration(
         storage: Storage,
@@ -400,22 +419,72 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// Returns the storage from the specified binding
     fn find(&self, binding: ManagedMemoryBinding) -> Result<&Slice, IoError> {
         let id = binding.descriptor();
+        let location = id.location();
 
-        if id.location().pool >= self.pools.len() as u8 {
+        // Uninitialized bindings (init=0) have default location {pool:0, page:0, slice:0}
+        // which would incorrectly resolve to whatever happens to be at that slot.
+        // Return NotFound so the kernel launch is gracefully skipped.
+        if location.init == 0 {
+            static UNINIT_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let count = UNINIT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 5 {
+                log::warn!(
+                    "[CUBECL] Uninitialized binding #{}: id={}",
+                    count,
+                    id.id.value,
+                );
+            }
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: "Binding has uninitialized memory location (init=0)".into(),
+            });
+        }
+
+        if location.pool >= self.pools.len() as u8 {
             return self.persistent.find(&binding);
         }
 
-        let pool =
-            self.pools
-                .get(id.location().pool as usize)
-                .ok_or_else(|| IoError::NotFound {
-                    backtrace: BackTrace::capture(),
-                    reason: format!("Pool {} doesn't exist", id.location().pool).into(),
-                })?;
+        let pool = self
+            .pools
+            .get(location.pool as usize)
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: format!("Pool {} doesn't exist", location.pool).into(),
+            })?;
 
         let slice = pool.find(&binding)?;
 
-        assert_eq!(slice.handle.descriptor(), binding.descriptor());
+        // Soft check: if the pool slot has been reassigned to a new descriptor,
+        // return NotFound instead of panicking. This can happen when a handle is
+        // dropped (freeing its pool slot) while a binding from the old handle is
+        // still pending in the task queue.
+        if slice.handle.descriptor() != binding.descriptor() {
+            static MISMATCH_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let count = MISMATCH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if count < 10 {
+                log::warn!(
+                    "[CUBECL_DEBUG] Descriptor mismatch #{}: pool={} page={} slice={} size={} old_id={} new_id={}",
+                    count,
+                    location.pool,
+                    location.page,
+                    location.slice,
+                    slice.storage.size(),
+                    binding.descriptor().id.value,
+                    slice.handle.descriptor().id.value,
+                );
+            }
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: format!(
+                    "Descriptor mismatch: slice has {:?} but binding has {:?}",
+                    slice.handle.descriptor(),
+                    binding.descriptor()
+                )
+                .into(),
+            });
+        }
 
         Ok(slice)
     }
@@ -463,7 +532,7 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
                     )
                 },
             );
-            return Ok(val);
+            return Self::ensure_initialized_reservation(val, "persistent.try_reserve");
         }
 
         if matches!(self.mode, MemoryAllocationMode::Persistent) || self.persistent.has_size(size) {
@@ -478,7 +547,9 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
                     )
                 },
             );
-            return allocated;
+            return allocated.and_then(|handle| {
+                Self::ensure_initialized_reservation(handle, "persistent.alloc")
+            });
         }
 
         self.logger.log_memory(
@@ -501,9 +572,8 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
                 size,
                 backtrace: BackTrace::capture(),
             })?;
-
         if let Some(slice) = pool.try_reserve(size) {
-            return Ok(slice);
+            return Self::ensure_initialized_reservation(slice, "dynamic.try_reserve");
         }
 
         let allocated = pool.alloc(&mut self.storage, size);
@@ -518,7 +588,7 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             },
         );
 
-        allocated
+        allocated.and_then(|handle| Self::ensure_initialized_reservation(handle, "dynamic.alloc"))
     }
 
     /// Fetch the storage used by the memory manager.
@@ -533,6 +603,15 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// change the mode of storage for different reasons.
     pub fn storage(&mut self) -> &mut Storage {
         &mut self.storage
+    }
+
+    /// Flush the storage deallocation queue, executing any pending `storage.dealloc()` calls.
+    ///
+    /// Called after `cleanup(explicit=true)` across all streams to ensure that ExclusivePool
+    /// pages freed via `storage.dealloc()` are actually executed (e.g. cuMemFreeAsync) so
+    /// that cuMemPoolTrimTo can reclaim the underlying CUDA memory on model unload.
+    pub fn flush_dealloc_queue(&mut self) {
+        self.storage.flush();
     }
 
     /// Get the current memory usage.
@@ -562,16 +641,23 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
         assigned: ManagedMemoryHandle,
         cursor: u64,
     ) -> Result<(), IoError> {
+        let reserved_debug = reserved.debug_summary();
+        let assigned_debug = assigned.debug_summary();
         let descriptor = reserved.descriptor();
+        let location = descriptor.location();
 
-        if descriptor.location().init == 0 {
+        if location.init == 0 {
             return Err(IoError::NotFound {
                 backtrace: BackTrace::capture(),
-                reason: "Reserved memory isn't initialized".into(),
+                reason: format!(
+                    "Reserved memory isn't initialized | reserved=[{}] assigned=[{}] cursor={}",
+                    reserved_debug, assigned_debug, cursor
+                )
+                .into(),
             });
         }
 
-        let pool_index = descriptor.location().pool as usize;
+        let pool_index = location.pool as usize;
         if pool_index >= self.pools.len() {
             return self.persistent.bind(reserved, assigned, cursor);
         }

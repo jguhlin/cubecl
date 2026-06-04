@@ -553,8 +553,8 @@ impl<D: Dialect> ExtractComponent<D> {
             }
             _ => {
                 let elem = out.elem();
-                let qualifier = out.const_qualifier();
                 let addr_space = D::address_space_for_variable(out);
+                let qualifier = lhs.const_qualifier();
                 let lhs = lhs.ensure_lvalue(f)?;
                 let out = out.fmt_left();
                 writeln!(
@@ -578,7 +578,13 @@ impl<D: Dialect> InsertComponent<D> {
             _ => {
                 let elem = out.elem();
                 let addr_space = D::address_space_for_variable(out);
-                return writeln!(f, "*(({addr_space}{elem}*)&{out} + {lhs}) = {rhs};");
+                // Fix: Use array subscript syntax for writes (consistent with reads).
+                // The reinterpret_cast treats the vector type (float_4) as an array of scalars (float[]).
+                // Generated: reinterpret_cast<float*>(&vec)[index] = value
+                return writeln!(
+                    f,
+                    "reinterpret_cast<{addr_space}{elem}*>(&{out})[{lhs}] = {rhs};"
+                );
             }
         };
 
